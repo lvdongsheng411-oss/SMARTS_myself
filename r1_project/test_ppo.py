@@ -9,7 +9,6 @@ from r1_project.env_wrapper import SmartsSingleAgentEnv
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 必须和 train_ppo.py 保持一致
 OBS_DIM = 16
 ACT_DIM = 3
 HIDDEN_DIM = 128
@@ -25,13 +24,6 @@ def orthogonal_init(layer, gain=np.sqrt(2)):
 
 
 class Actor(nn.Module):
-    """
-    策略网络：
-    输入观测
-    输出高斯策略的 mean 和 std
-    测试时采用贪心策略：直接取 mean 作为最大概率动作
-    """
-
     def __init__(self, obs_dim, act_dim, hidden_dim):
         super().__init__()
 
@@ -61,53 +53,10 @@ class Actor(nn.Module):
         return mean, std
 
 
-def scale_action(action, obs=None):
-    """
-    和训练阶段完全一致的动作映射：
-    1. 贪心动作先映射为环境动作
-    2. 使用动态 steering 限幅，保证网页端演示更稳
-    """
-    a = np.array(action, dtype=np.float32)
-    a = np.clip(a, -1.0, 1.0)
-
-    throttle = (a[0] + 1.0) / 2.0
-    brake = (a[1] + 1.0) / 2.0
-
-    # 避免同时大油门大刹车
-    if throttle >= brake:
-        brake *= 0.15
-    else:
-        throttle *= 0.15
-
-    steer_limit = 0.12
-
-    if obs is not None:
-        ego_speed = float(np.clip(obs[0], -1.0, 1.0) * 20.0)
-        heading_err = abs(float(np.clip(obs[2], -1.0, 1.0))) * np.pi
-
-        if ego_speed < 3.0:
-            steer_limit = 0.20
-        elif ego_speed < 8.0:
-            steer_limit = 0.16
-        else:
-            steer_limit = 0.12
-
-        if heading_err > 0.18:
-            steer_limit = min(0.22, steer_limit + 0.04)
-
-    steering = np.clip(0.18 * a[2], -steer_limit, steer_limit)
-
-    throttle = np.clip(throttle, 0.0, 1.0)
-    brake = np.clip(brake, 0.0, 1.0)
-
-    return np.array([throttle, brake, steering], dtype=np.float32)
-
-
 def select_greedy_action(actor, obs):
     """
     贪心策略：
-    对当前连续动作高斯策略来说，最大概率动作就是 mean。
-    因此网页端演示每一步都直接取 mean，不采样。
+    测试演示时不采样，直接取高斯策略 mean。
     """
     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -116,13 +65,95 @@ def select_greedy_action(actor, obs):
 
     raw_action = mean.squeeze(0).cpu().numpy()
     raw_action = np.clip(raw_action, -1.0, 1.0)
+
     return raw_action
+
+
+def scale_action_for_demo(raw_action, obs, prev_env_action=None):
+    """
+    演示优化版动作映射：
+    1. 油门/刹车互斥
+    2. 动态转向限幅
+    3. 转向低通滤波
+    4. 油门低通滤波
+    5. 起步阶段给最小油门，避免车不动
+    """
+
+    a = np.array(raw_action, dtype=np.float32)
+    a = np.clip(a, -1.0, 1.0)
+
+    # =========================
+    # 1. 恢复状态信息
+    # =========================
+    ego_speed = float(np.clip(obs[0], -1.0, 1.0) * 20.0)
+    heading_err = abs(float(np.clip(obs[2], -1.0, 1.0))) * np.pi
+    lane_err = abs(float(np.clip(obs[1], -1.0, 1.0)) * 3.0)
+
+    # =========================
+    # 2. 油门/刹车映射
+    # =========================
+    throttle = (a[0] + 1.0) / 2.0
+    brake = (a[1] + 1.0) / 2.0
+
+    # 油门和刹车互斥
+    if throttle >= brake:
+        brake = 0.0
+    else:
+        throttle = 0.0
+
+    # 起步阶段给一个最小油门，避免演示时卡住
+    if ego_speed < 1.0 and brake < 0.2:
+        throttle = max(throttle, 0.35)
+        brake = 0.0
+
+    # 巡航阶段限制过大油门，让车更稳
+    if ego_speed > 8.0:
+        throttle = min(throttle, 0.45)
+
+    # =========================
+    # 3. 动态 steering 限幅
+    # =========================
+    if ego_speed < 3.0:
+        steer_limit = 0.18
+    elif ego_speed < 8.0:
+        steer_limit = 0.14
+    else:
+        steer_limit = 0.10
+
+    # 如果偏航或偏离车道明显，允许多一点纠偏
+    if heading_err > 0.20 or lane_err > 0.8:
+        steer_limit = min(0.22, steer_limit + 0.04)
+
+    steering = np.clip(0.16 * a[2], -steer_limit, steer_limit)
+
+    # =========================
+    # 4. 动作低通滤波
+    # =========================
+    if prev_env_action is not None:
+        prev_throttle = float(prev_env_action[0])
+        prev_brake = float(prev_env_action[1])
+        prev_steering = float(prev_env_action[2])
+
+        # 转向强平滑，减少左右抖动
+        steering = 0.75 * prev_steering + 0.25 * steering
+
+        # 油门轻平滑，避免速度突变
+        throttle = 0.60 * prev_throttle + 0.40 * throttle
+
+        # 刹车轻平滑
+        brake = 0.60 * prev_brake + 0.40 * brake
+
+    throttle = np.clip(throttle, 0.0, 1.0)
+    brake = np.clip(brake, 0.0, 1.0)
+    steering = np.clip(steering, -0.25, 0.25)
+
+    return np.array([throttle, brake, steering], dtype=np.float32)
 
 
 def test():
     env = SmartsSingleAgentEnv(
         scenario_path="scenarios/mymap",
-        headless=False,   # 网页端演示
+        headless=False,
     )
 
     actor = Actor(OBS_DIM, ACT_DIM, HIDDEN_DIM).to(device)
@@ -133,34 +164,41 @@ def test():
     print(f"准备加载 Actor 模型: {actor_path}")
     actor.load_state_dict(torch.load(actor_path, map_location=device))
     actor.eval()
-    print("Actor 模型加载成功，开始使用贪心策略测试。")
+    print("Actor 模型加载成功，开始使用演示优化版贪心策略测试。")
 
     for episode in range(1, NUM_EPISODES + 1):
         obs, info = env.reset()
         episode_reward = 0.0
+        prev_env_action = None
 
         print(f"第 {episode} 回合开始")
 
         for step in range(MAX_EPISODE_STEPS):
-            # 贪心：直接取 mean
             raw_action = select_greedy_action(actor, obs)
 
-            # 再映射成环境动作
-            env_action = scale_action(raw_action, obs)
+            env_action = scale_action_for_demo(
+                raw_action=raw_action,
+                obs=obs,
+                prev_env_action=prev_env_action,
+            )
 
             obs, reward, done, info = env.step(env_action)
             episode_reward += reward
 
+            prev_env_action = env_action.copy()
+
             print(
                 f"episode={episode}, "
                 f"step={step}, "
-                f"reward={reward:.6f}, "
-                f"raw_action={raw_action}, "
+                f"reward={reward:.3f}, "
+                f"speed={obs[0] * 20.0:.2f}, "
+                f"lane_err={obs[1] * 3.0:.2f}, "
+                f"heading_err={obs[2] * np.pi:.2f}, "
                 f"env_action={env_action}"
             )
 
             if done:
-                print(f"第 {episode} 回合结束，累计奖励 = {episode_reward:.6f}")
+                print(f"第 {episode} 回合结束，累计奖励 = {episode_reward:.3f}")
                 break
 
     env.close()
