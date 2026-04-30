@@ -1,3 +1,5 @@
+import csv
+import time
 import numpy as np
 from pathlib import Path
 
@@ -11,7 +13,6 @@ from r1_project.env_wrapper import SmartsSingleAgentEnv
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 现在 obs_adapter.py 输出 16 维
 OBS_DIM = 16
 ACT_DIM = 3
 HIDDEN_DIM = 128
@@ -26,7 +27,8 @@ CLIP_EPS = 0.2
 ROLLOUT_STEPS = 1024
 UPDATE_EPOCHS = 10
 MINI_BATCH_SIZE = 256
-TOTAL_UPDATES = 150
+TOTAL_UPDATES = 800
+REWARD_LOG_FILENAME = "training_reward_log.csv"
 
 ENTROPY_COEF = 0.005
 VALUE_COEF = 0.5
@@ -49,14 +51,12 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.mean_head = nn.Linear(hidden_dim, act_dim)
 
-        # log_std 设小一些，初期探索更稳定
         self.log_std = nn.Parameter(torch.full((act_dim,), -1.0))
 
         self.apply(orthogonal_init)
         orthogonal_init(self.mean_head, gain=0.01)
 
         with torch.no_grad():
-            # 初始策略稍微偏向：轻给油、少刹车、转向居中
             self.mean_head.bias[0] = 0.2
             self.mean_head.bias[1] = -0.8
             self.mean_head.bias[2] = 0.0
@@ -68,7 +68,6 @@ class Actor(nn.Module):
         mean = self.mean_head(x)
         mean = torch.tanh(mean)
 
-        # 防止 std 过大或过小
         log_std = torch.clamp(self.log_std, -2.5, 0.5)
         std = torch.exp(log_std)
 
@@ -98,7 +97,11 @@ class Critic(nn.Module):
 def scale_action(action, obs=None):
     """
     将 Actor 输出的 [-1, 1] 原始动作映射成环境动作 [throttle, brake, steering]。
-    这里做“动态转向限幅”，速度越快转向越保守；偏航较大时允许略增大转向上限。
+
+    这里采用动态 steering 限幅：
+    1. 低速时允许稍大转向，方便转弯和纠偏
+    2. 高速时限制转向，减少左右摆动
+    3. 航向误差较大时，适当放宽转向上限
     """
     a = np.array(action, dtype=np.float32)
     a = np.clip(a, -1.0, 1.0)
@@ -106,7 +109,7 @@ def scale_action(action, obs=None):
     throttle = (a[0] + 1.0) / 2.0
     brake = (a[1] + 1.0) / 2.0
 
-    # 避免同时大油门大刹车
+    # 避免同时大油门和大刹车
     if throttle >= brake:
         brake *= 0.15
     else:
@@ -115,7 +118,6 @@ def scale_action(action, obs=None):
     steer_limit = 0.12
 
     if obs is not None:
-        # obs[0] 是归一化后的 ego_speed，按 20m/s 反推
         ego_speed = float(np.clip(obs[0], -1.0, 1.0) * 20.0)
         heading_err = abs(float(np.clip(obs[2], -1.0, 1.0))) * np.pi
 
@@ -126,7 +128,6 @@ def scale_action(action, obs=None):
         else:
             steer_limit = 0.12
 
-        # 如果偏航较大，允许额外增加一点转向能力
         if heading_err > 0.18:
             steer_limit = min(0.22, steer_limit + 0.04)
 
@@ -142,8 +143,8 @@ def sample_action(actor, obs):
     """
     训练阶段从高斯策略中采样动作。
     返回：
-    - clipped_raw_action: PPO 内部使用的动作（已裁剪到 [-1, 1]）
-    - log_prob: 对应对数概率
+    1. raw_action：PPO 内部动作，范围裁剪到 [-1, 1]
+    2. log_prob：该动作在当前策略下的对数概率
     """
     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -160,6 +161,8 @@ def sample_action(actor, obs):
 
 
 class RolloutBuffer:
+    """PPO 采样缓存区。"""
+
     def __init__(self):
         self.obs = []
         self.actions = []
@@ -179,7 +182,9 @@ class RolloutBuffer:
 
 def compute_gae(rewards, dones, values, last_value, gamma=0.99, lam=0.95):
     """
-    GAE 计算，正确使用最后状态价值 bootstrap。
+    GAE 优势估计。
+    advantages 用于更新 Actor。
+    returns 用于训练 Critic。
     """
     advantages = []
     gae = 0.0
@@ -204,7 +209,7 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer, last_ob
     dones = buffer.dones
     values = buffer.values
 
-    # 正确 bootstrap：只有 rollout 最后不是 done，才估计 last_value
+    # 如果 rollout 最后不是终止状态，用 Critic 估计最后一个状态价值
     if last_done:
         last_value = 0.0
     else:
@@ -212,7 +217,14 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer, last_ob
             last_obs_tensor = torch.tensor(last_obs, dtype=torch.float32, device=device).unsqueeze(0)
             last_value = critic(last_obs_tensor).item()
 
-    advantages, returns = compute_gae(rewards, dones, values, last_value, GAMMA, LAMBDA)
+    advantages, returns = compute_gae(
+        rewards,
+        dones,
+        values,
+        last_value,
+        GAMMA,
+        LAMBDA,
+    )
 
     advantages = torch.tensor(np.array(advantages), dtype=torch.float32, device=device)
     returns = torch.tensor(np.array(returns), dtype=torch.float32, device=device)
@@ -239,7 +251,9 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer, last_ob
             batch_advantages = advantages[batch_idx]
             batch_returns = returns[batch_idx]
 
-            # ========== Actor ==========
+            # =========================
+            # 更新 Actor
+            # =========================
             mean, std = actor(batch_obs)
             dist = Normal(mean, std)
 
@@ -257,7 +271,9 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer, last_ob
             torch.nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
             actor_optimizer.step()
 
-            # ========== Critic ==========
+            # =========================
+            # 更新 Critic
+            # =========================
             values_pred = critic(batch_obs).squeeze(-1)
             critic_loss = ((values_pred - batch_returns) ** 2).mean()
 
@@ -277,6 +293,8 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer, last_ob
 
 
 def train():
+    train_start_time = time.time()
+
     env = SmartsSingleAgentEnv(
         scenario_path="scenarios/mymap",
         headless=True,
@@ -291,16 +309,36 @@ def train():
     buffer = RolloutBuffer()
 
     obs, _ = env.reset()
+
     episode_reward = 0.0
+    episode_steps = 0
     episode_count = 0
+    episode_rewards = []
+
+    project_dir = Path(__file__).resolve().parent
+    reward_log_path = project_dir / REWARD_LOG_FILENAME
+
+    with open(reward_log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "episode",
+            "update",
+            "episode_reward",
+            "mean_reward_all",
+            "mean_reward_20",
+            "mean_reward_100",
+            "episode_steps",
+        ])
+
+    print(f"训练奖励日志将保存到: {reward_log_path}")
 
     for update in range(TOTAL_UPDATES):
         buffer.clear()
-
         last_done = False
 
         for step in range(ROLLOUT_STEPS):
             obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
             with torch.no_grad():
                 value = critic(obs_tensor).item()
 
@@ -317,17 +355,44 @@ def train():
             buffer.values.append(float(value))
 
             episode_reward += reward
+            episode_steps += 1
             obs = next_obs
             last_done = done
 
             if done:
                 episode_count += 1
+
+                episode_rewards.append(float(episode_reward))
+
+                mean_reward_all = float(np.mean(episode_rewards))
+                mean_reward_20 = float(np.mean(episode_rewards[-20:]))
+                mean_reward_100 = float(np.mean(episode_rewards[-100:]))
+
+                with open(reward_log_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        episode_count,
+                        update + 1,
+                        float(episode_reward),
+                        mean_reward_all,
+                        mean_reward_20,
+                        mean_reward_100,
+                        episode_steps,
+                    ])
+
                 print(
                     f"[Episode {episode_count}] "
-                    f"update={update + 1}, episode_reward={episode_reward:.3f}"
+                    f"update={update + 1}/{TOTAL_UPDATES}, "
+                    f"episode_reward={episode_reward:.3f}, "
+                    f"mean_reward_all={mean_reward_all:.3f}, "
+                    f"mean_reward_20={mean_reward_20:.3f}, "
+                    f"mean_reward_100={mean_reward_100:.3f}, "
+                    f"episode_steps={episode_steps}"
                 )
+
                 obs, _ = env.reset()
                 episode_reward = 0.0
+                episode_steps = 0
 
         actor_loss, critic_loss = ppo_update(
             actor,
@@ -341,7 +406,9 @@ def train():
 
         print(
             f"PPO update {update + 1}/{TOTAL_UPDATES} 完成 | "
-            f"actor_loss={actor_loss:.6f}, critic_loss={critic_loss:.6f}"
+            f"已训练回合数={episode_count}, "
+            f"actor_loss={actor_loss:.6f}, "
+            f"critic_loss={critic_loss:.6f}"
         )
 
     env.close()
@@ -359,6 +426,14 @@ def train():
     print(f"训练结束，Actor 模型已保存到: {actor_path}")
     print(f"训练结束，Critic 模型已保存到: {critic_path}")
     print("训练结束，模型已保存。")
+
+    train_end_time = time.time()
+    elapsed_seconds = int(train_end_time - train_start_time)
+
+    elapsed_hours = elapsed_seconds // 3600
+    elapsed_minutes = (elapsed_seconds % 3600) // 60
+
+    print(f"训练总耗时: {elapsed_hours}h{elapsed_minutes}min")
 
 
 if __name__ == "__main__":
