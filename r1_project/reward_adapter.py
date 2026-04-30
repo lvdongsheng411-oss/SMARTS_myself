@@ -1,4 +1,13 @@
 import math
+import numpy as np
+
+
+def _get(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def _clip(x, low, high):
@@ -6,7 +15,7 @@ def _clip(x, low, high):
 
 
 def _angle_diff(a, b):
-    d = a - b
+    d = float(a) - float(b)
     while d > math.pi:
         d -= 2 * math.pi
     while d < -math.pi:
@@ -14,30 +23,28 @@ def _angle_diff(a, b):
     return d
 
 
-def _safe_waypoint_paths(waypoint_paths):
-    if waypoint_paths is None:
-        return []
+def _get_waypoint_heading(waypoint_paths, path_idx=0, wp_idx=0, default=0.0):
+    if not isinstance(waypoint_paths, dict):
+        return default
 
-    if isinstance(waypoint_paths, dict):
-        return list(waypoint_paths.values())
+    headings = waypoint_paths.get("heading", None)
+    if headings is None:
+        return default
 
-    if isinstance(waypoint_paths, (list, tuple)):
-        return list(waypoint_paths)
+    headings = np.asarray(headings)
 
     try:
-        return list(waypoint_paths)
+        return float(headings[path_idx][wp_idx])
     except Exception:
-        return []
+        return default
 
 
-def _get_waypoint(path, idx):
-    if path is None:
-        return None
-    if not hasattr(path, "__len__") or len(path) == 0:
-        return None
-    if idx < len(path):
-        return path[idx]
-    return path[-1]
+def _event_true(events, key):
+    if events is None:
+        return False
+    if isinstance(events, dict):
+        return bool(events.get(key, 0))
+    return bool(getattr(events, key, False))
 
 
 def compute_reward(
@@ -48,175 +55,123 @@ def compute_reward(
     prev_goal_dist=None,
     current_goal_dist=None,
 ):
-    """
-    强化版 reward：
-    1. 保留少量 env_reward
-    2. 速度奖励
-    3. 车道中心奖励
-    4. 航向一致性奖励
-    5. 动作平滑惩罚
-    6. 距离终点进度奖励（新增重点）
-    7. 碰撞/越界/逆行惩罚
-    8. 到达终点大奖励
-    """
     reward = 0.0
 
-    # =========================================================
-    # 1. 自车状态
-    # =========================================================
-    ego = agent_obs["ego_vehicle_state"]
+    # 1. 保留 SMARTS 原始 route-progress reward
+    reward += 1.0 * float(env_reward)
 
-    ego_speed = float(getattr(ego, "speed", 0.0))
-    ego_pos = getattr(ego, "position", [0.0, 0.0, 0.0])
-    ego_x = float(ego_pos[0])
-    ego_y = float(ego_pos[1])
-    ego_heading = float(getattr(ego, "heading", 0.0))
+    ego = _get(agent_obs, "ego_vehicle_state", {})
 
-    # =========================================================
-    # 2. waypoint 信息
-    # =========================================================
-    waypoint_paths = agent_obs.get("waypoint_paths", None)
-    paths = _safe_waypoint_paths(waypoint_paths)
+    ego_speed = float(_get(ego, "speed", 0.0))
+    ego_heading = float(_get(ego, "heading", 0.0))
 
-    signed_lane_error = 0.0
-    heading_error_now = 0.0
-    speed_limit = 13.89
+    lane_position = _get(ego, "lane_position", None)
+    lane_position = np.asarray(lane_position)
 
-    if len(paths) > 0:
-        path0 = paths[0]
-        wp0 = _get_waypoint(path0, 0)
+    if lane_position.ndim > 0 and lane_position.size >= 2:
+        signed_lane_error = float(lane_position[1])
+    else:
+        signed_lane_error = 0.0
 
-        if wp0 is not None:
-            wp0_pos = getattr(wp0, "pos", [ego_x, ego_y])
-            wp0_x = float(wp0_pos[0])
-            wp0_y = float(wp0_pos[1])
-            wp0_heading = float(getattr(wp0, "heading", 0.0))
+    waypoint_paths = _get(agent_obs, "waypoint_paths", {})
+    wp0_heading = _get_waypoint_heading(waypoint_paths, 0, 0, ego_heading)
 
-            dx = ego_x - wp0_x
-            dy = ego_y - wp0_y
-
-            signed_lane_error = -math.sin(wp0_heading) * dx + math.cos(wp0_heading) * dy
-            heading_error_now = _angle_diff(ego_heading, wp0_heading)
-            speed_limit = float(getattr(wp0, "speed_limit", 13.89))
+    heading_error_now = _angle_diff(ego_heading, wp0_heading)
 
     abs_lane_error = abs(signed_lane_error)
     abs_heading_error = abs(heading_error_now)
 
-    # =========================================================
-    # 3. 少量保留环境原始奖励
-    # =========================================================
-    reward += 0.05 * float(env_reward)
+    speed_limit = 13.89
 
-    # =========================================================
-    # 4. 速度奖励：鼓励接近合理巡航速度，不鼓励过慢也不鼓励盲目超速
-    # =========================================================
-    target_speed = min(0.75 * speed_limit, 10.0)
+    # 2. 车道保持
+    reward -= 0.3 * abs_lane_error
+
+    if abs_lane_error > 1.5:
+        reward -= 1.0
+
+    if abs_lane_error > 2.5:
+        reward -= 3.0
+
+    # 3. 航向一致性
+    reward -= 0.4 * abs_heading_error
+
+    if abs_heading_error > 0.5:
+        reward -= 1.0
+
+    # 4. 速度 shaping
+    target_speed = min(0.8 * speed_limit, 12.0)
 
     if target_speed < 2.0:
         target_speed = 2.0
 
-    speed_error = abs(ego_speed - target_speed)
-
-    # 速度越接近目标越好
-    reward += 1.2 * (1.0 - min(speed_error / max(target_speed, 1.0), 1.0))
-
-    # 极低速轻微惩罚，避免停住不动
     if ego_speed < 0.3:
+        reward -= 5.0
+    elif ego_speed < 1.0:
+        reward -= 2.0
+    else:
+        speed_score = 1.0 - min(abs(ego_speed - target_speed) / max(target_speed, 1.0), 1.0)
+        reward += 0.3 * speed_score
+
+    if ego_speed > speed_limit + 2.0:
         reward -= 1.0
 
-    # 超速轻罚
-    if ego_speed > speed_limit + 1.5:
-        reward -= 1.5
+    # 5. 距离终点进度奖励
+    # 只有车辆真的有速度时才给，避免“原地不动也奖励”
+    if (
+        prev_goal_dist is not None
+        and current_goal_dist is not None
+        and ego_speed > 0.2
+    ):
+        progress_to_goal = prev_goal_dist - current_goal_dist
+        reward += 0.8 * _clip(progress_to_goal, -2.0, 2.0)
 
-    # =========================================================
-    # 5. 车道中心奖励：比“纯重罚”更稳定
-    # =========================================================
-    lane_center_reward = 1.5 * (1.0 - min(abs_lane_error / 1.5, 1.0))
-    reward += lane_center_reward
-
-    if abs_lane_error > 1.2:
-        reward -= 2.0
-    if abs_lane_error > 2.0:
-        reward -= 6.0
-
-    # =========================================================
-    # 6. 航向一致性奖励
-    # =========================================================
-    heading_align_reward = 1.2 * (1.0 - min(abs_heading_error / 0.35, 1.0))
-    reward += heading_align_reward
-
-    if abs_heading_error > 0.30:
-        reward -= 1.5
-    if abs_heading_error > 0.60:
-        reward -= 4.0
-
-    # =========================================================
-    # 7. 距离终点奖励（新增重点）
-    #    progress = 上一步距离 - 当前距离
-    #    越接近终点，奖励越高
-    # =========================================================
-    if prev_goal_dist is not None and current_goal_dist is not None:
-        progress = prev_goal_dist - current_goal_dist
-
-        # 每一步朝终点前进就给奖励，后退则扣分
-        reward += 2.5 * _clip(progress, -2.0, 2.0)
-
-        # 离终点越近，额外给一点“接近奖励”
-        close_bonus = 1.2 * (1.0 - min(current_goal_dist / 80.0, 1.0))
+        close_bonus = 0.3 * (1.0 - min(current_goal_dist / 100.0, 1.0))
         reward += close_bonus
 
-    # =========================================================
-    # 8. 动作平滑 + 更稳定 steering 控制
-    # =========================================================
+    # 6. 动作平滑
     if action is not None:
         throttle = float(action[0])
         brake = float(action[1])
         steering = float(action[2])
 
-        # 大转向惩罚：速度越高，越不允许大打方向
-        if ego_speed < 3.0:
-            reward -= 0.30 * abs(steering)
-        elif ego_speed < 8.0:
-            reward -= 0.70 * abs(steering)
-        else:
-            reward -= 1.20 * abs(steering)
+        reward -= 0.2 * abs(steering)
 
-        # 油门和刹车同时较大，不合理
         if throttle > 0.2 and brake > 0.2:
-            reward -= 1.5
+            reward -= 0.8
 
         if prev_action is not None:
             prev_throttle = float(prev_action[0])
             prev_brake = float(prev_action[1])
             prev_steering = float(prev_action[2])
 
-            # 转向变化过快，重点惩罚
-            reward -= 1.6 * abs(steering - prev_steering)
+            reward -= 0.5 * abs(steering - prev_steering)
+            reward -= 0.1 * abs(throttle - prev_throttle)
+            reward -= 0.1 * abs(brake - prev_brake)
 
-            # 油门/刹车突变也轻罚
-            reward -= 0.25 * abs(throttle - prev_throttle)
-            reward -= 0.25 * abs(brake - prev_brake)
+    # 7. 事件奖励/惩罚
+    events = _get(agent_obs, "events", None)
 
-    # =========================================================
-    # 9. 事件奖励 / 惩罚
-    # =========================================================
-    events = agent_obs.get("events", None)
+    if _event_true(events, "collisions"):
+        reward -= 100.0
 
-    if events is not None:
-        if getattr(events, "collisions", []):
-            reward -= 150.0
+    if _event_true(events, "off_road"):
+        reward -= 80.0
 
-        if getattr(events, "off_road", False):
-            reward -= 120.0
+    if _event_true(events, "off_route"):
+        reward -= 40.0
 
-        if getattr(events, "wrong_way", False):
-            reward -= 40.0
+    if _event_true(events, "wrong_way"):
+        reward -= 30.0
 
-        if getattr(events, "reached_goal", False):
-            reward += 250.0
+    if _event_true(events, "not_moving"):
+        reward -= 10.0
 
-    # =========================================================
-    # 10. 最终裁剪
-    # =========================================================
-    reward = _clip(reward, -200.0, 200.0)
+    if _event_true(events, "reached_goal"):
+        reward += 120.0
+
+    if _event_true(events, "reached_max_episode_steps"):
+        reward -= 5.0
+
+    reward = _clip(reward, -100.0, 100.0)
+
     return reward
